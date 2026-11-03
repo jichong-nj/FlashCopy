@@ -1,0 +1,14 @@
+# Windows 编译产物
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.idb
+*.map
+*.res
+
+# 构建/调试目录
+Release/
+Debug/
+x64/
+.vs/
