@@ -19,6 +19,7 @@
 
 /* 是否打印每个报文传给 nping 的载荷（FlashHeader+body）十六进制转储，由 -x 开启 */
 static int g_dump = 0;
+static int g_parallel = 5;   /* 并发 nping 进程数，由 -n 指定 */
 
 /* 传给 nping --data 的载荷上限：FlashHeader + 最大分片/最大文件名 + 余量 */
 #define MAX_PAYLOAD (sizeof(FlashHeader) + FLASH_MAX_CHUNK + FLASH_MAX_NAME + 16)
@@ -58,9 +59,10 @@ static void print_usage(const char *prog)
         "\n"
         "选项:\n"
         "  -s <字节>  分片大小，默认 1024，范围 64..1400\n"
-        "  -d <毫秒>  报文之间的间隔，默认 2（0 表示不等待）\n"
+        "  -d <毫秒>  同一 nping 进程内重复报文之间的间隔，默认 2（0 表示不等待）\n"
         "  -r <次数>  整份文件重复发送的次数，默认 1\n"
         "  -m <次数>  元信息报文在每轮中的重发次数，默认 3\n"
+        "  -n <并发>  并发启动的 nping 进程数（加速大文件发送），默认 5\n"
         "  -b <本机IP> 通过 nping -S 指定源 IP（默认由系统路由决定）\n"
         "  -x         打印每个报文传给 nping 的载荷（十六进制转储）\n"
         "  -h         显示本帮助\n"
@@ -139,17 +141,31 @@ static void to_hex(const uint8_t *p, size_t len, char *out)
 }
 
 /*
- * 通过 nping.exe 发送 count 个相同的载荷（同一分片内容相同，故可一次性批量发送）。
- * 返回 0 表示成功，非 0 表示失败（已打印告警）。
+ * 并发池：最多同时运行 g_parallel 个 nping 子进程。
+ * g_pool 存放仍在运行的子进程句柄，g_pool_n 为当前数量。
  */
-static int send_via_nping(const char *dest_ip, const char *bind_str,
+#define MAX_PARALLEL 64
+static HANDLE g_pool[MAX_PARALLEL];
+static int    g_pool_n = 0;
+
+/*
+ * 通过 nping.exe 发送 count 个相同的载荷（同一分片内容相同，故可一次性批量发送）。
+ * 用 CreateProcess 启动 nping，并把它的 stdout/stderr 重定向到 NUL（FlashSend 只发不等收，
+ * 不需要 nping 的输出，也避免多个并发进程的输出在控制台交错）。
+ * 返回子进程句柄供并发池管理；返回 NULL 表示启动失败（已打印告警）。
+ */
+static HANDLE spawn_nping(const char *dest_ip, const char *bind_str,
                           const uint8_t *payload, size_t pay_len,
                           uint32_t count, int delay_ms)
 {
     char hex[2 * MAX_PAYLOAD + 1];
     char cmd[8192];
     int off = 0;
-    int r;
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    SECURITY_ATTRIBUTES sa;
+    HANDLE hnul;
+    BOOL ok;
 
     to_hex(payload, pay_len, hex);
     off += snprintf(cmd + off, sizeof(cmd) - off,
@@ -161,18 +177,54 @@ static int send_via_nping(const char *dest_ip, const char *bind_str,
         off += snprintf(cmd + off, sizeof(cmd) - off, " -S %s", bind_str);
     off += snprintf(cmd + off, sizeof(cmd) - off, " %s", dest_ip);
 
-    r = system(cmd);
-    if (r == -1) {
-        fprintf(stderr,
-                "[错误] 无法启动 nping，请确认 nping.exe 在 PATH 中（Nmap 已安装）\n");
-        return -1;
+    /* 把 nping 的输出重定向到 NUL */
+    sa.nLength = sizeof(sa);
+    sa.lpSecurityDescriptor = NULL;
+    sa.bInheritHandle = TRUE;
+    hnul = CreateFileA("NUL", GENERIC_WRITE, FILE_SHARE_WRITE, &sa,
+                       OPEN_EXISTING, 0, NULL);
+
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput  = (hnul != INVALID_HANDLE_VALUE) ? hnul : GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdOutput = (hnul != INVALID_HANDLE_VALUE) ? hnul : GetStdHandle(STD_OUTPUT_HANDLE);
+    si.hStdError  = (hnul != INVALID_HANDLE_VALUE) ? hnul : GetStdHandle(STD_ERROR_HANDLE);
+
+    ZeroMemory(&pi, sizeof(pi));
+    ok = CreateProcessA(NULL, cmd, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi);
+    if (hnul != INVALID_HANDLE_VALUE)
+        CloseHandle(hnul);
+
+    if (!ok) {
+        fprintf(stderr, "[错误] 无法启动 nping（CreateProcess 失败，请确认 nping.exe 在 PATH 中）\n");
+        return NULL;
     }
-    if (r != 0) {
-        fprintf(stderr,
-                "[警告] nping 返回非零退出码 %d（可能权限不足或发送失败，继续）\n", r);
-        return -1;
+    CloseHandle(pi.hThread);
+    return pi.hProcess;   /* 调用方负责 WaitForSingleObject + CloseHandle */
+}
+
+/* 等待池中任意一个 nping 结束，回收其句柄并打印非零退出告警 */
+static void pool_wait_one(void)
+{
+    DWORD r = WaitForMultipleObjects((DWORD)g_pool_n, g_pool, FALSE, INFINITE);
+    if (r >= WAIT_OBJECT_0 && r < WAIT_OBJECT_0 + (DWORD)g_pool_n) {
+        int k = (int)(r - WAIT_OBJECT_0);
+        DWORD ec = 0;
+        if (GetExitCodeProcess(g_pool[k], &ec) && ec != 0)
+            fprintf(stderr, "[警告] nping 退出码 %lu（可能权限不足或发送失败）\n",
+                    (unsigned long)ec);
+        CloseHandle(g_pool[k]);
+        g_pool[k] = g_pool[g_pool_n - 1];
+        g_pool_n--;
     }
-    return 0;
+}
+
+/* 等待并回收池中所有仍在运行的 nping */
+static void pool_drain(void)
+{
+    while (g_pool_n > 0)
+        pool_wait_one();
 }
 
 int main(int argc, char **argv)
@@ -197,7 +249,7 @@ int main(int argc, char **argv)
     uint8_t *data_buf = NULL;
     uint32_t sent_data = 0, sent_meta = 0;
     DWORD t0;
-    int i, rc;
+    int i;
     uint32_t idx;
 
     SetConsoleOutputCP(CP_UTF8);
@@ -215,6 +267,8 @@ int main(int argc, char **argv)
                 rounds = atoi(argv[++i]);
             } else if (!strcmp(argv[i], "-m") && i + 1 < argc) {
                 meta_repeat = atoi(argv[++i]);
+            } else if (!strcmp(argv[i], "-n") && i + 1 < argc) {
+                g_parallel = atoi(argv[++i]);
             } else if (!strcmp(argv[i], "-b") && i + 1 < argc) {
                 bind_str = argv[++i];
             } else if (!strcmp(argv[i], "-x") || !strcmp(argv[i], "--dump")) {
@@ -244,6 +298,10 @@ int main(int argc, char **argv)
     }
     if (delay_ms < 0 || rounds < 1 || meta_repeat < 1) {
         fprintf(stderr, "[错误] -d/-r/-m 参数不合法\n");
+        return 2;
+    }
+    if (g_parallel < 1 || g_parallel > MAX_PARALLEL) {
+        fprintf(stderr, "[错误] -n 并发数必须在 1..%d 之间\n", MAX_PARALLEL);
         return 2;
     }
     if (!flash_parse_ipv4(dest_ip, dst_ip)) {
@@ -300,9 +358,9 @@ int main(int argc, char **argv)
 
     printf("[启动] 文件=\"%s\" 大小=%llu B 分片大小=%u B 分片数=%u 会话=0x%08X\n",
            path, (unsigned long long)file_size, chunk, total, session);
-    printf("[启动] 目的IP=%s 源IP=%s 轮数=%d 元信息重发=%d 间隔=%d ms（经 nping 发送，只发不等收）\n",
+    printf("[启动] 目的IP=%s 源IP=%s 轮数=%d 元信息重发=%d 间隔=%d ms 并发=%d（经 nping 发送，只发不等收）\n",
            dest_ip, has_bind ? bind_str : "系统路由决定",
-           rounds, meta_repeat, delay_ms);
+           rounds, meta_repeat, delay_ms, g_parallel);
     fflush(stdout);
 
     t0 = GetTickCount();
@@ -319,16 +377,19 @@ int main(int argc, char **argv)
         }
         if (g_dump)
             hexdump(payload, pl, "元信息");
-        rc = send_via_nping(dest_ip, has_bind ? bind_str : NULL,
-                            payload, pl, meta_count, delay_ms);
-        if (rc == 0)
-            sent_meta += meta_count;
+        if (g_pool_n >= g_parallel) pool_wait_one();
+        {
+            HANDLE h = spawn_nping(dest_ip, has_bind ? bind_str : NULL,
+                                   payload, pl, meta_count, delay_ms);
+            if (h) {
+                g_pool[g_pool_n++] = h;
+                sent_meta += meta_count;
+            }
+        }
         printf("[发送] 元信息 会话=0x%08X 文件名=\"%s\" 共 %u 片 大小=%llu B 重发=%u -> %s\n",
                session, name, total,
                (unsigned long long)file_size, meta_count, dest_ip);
         fflush(stdout);
-        if (delay_ms)
-            Sleep((DWORD)delay_ms);
     }
 
     /* 数据分片：每片批量发送 rounds 次 */
@@ -365,16 +426,21 @@ int main(int argc, char **argv)
             snprintf(tag, sizeof(tag), "数据#%u", idx);
             hexdump(payload, pl, tag);
         }
-        rc = send_via_nping(dest_ip, has_bind ? bind_str : NULL,
-                            payload, pl, (uint32_t)rounds, delay_ms);
-        if (rc == 0)
-            sent_data += (uint32_t)rounds;
+        if (g_pool_n >= g_parallel) pool_wait_one();
+        {
+            HANDLE h = spawn_nping(dest_ip, has_bind ? bind_str : NULL,
+                                  payload, pl, (uint32_t)rounds, delay_ms);
+            if (h) {
+                g_pool[g_pool_n++] = h;
+                sent_data += (uint32_t)rounds;
+            }
+        }
         printf("[发送] 第 %u/%u 片  %u B  重发=%u  会话=0x%08X -> %s\n",
                idx, total, (unsigned)got, (unsigned)rounds, session, dest_ip);
         fflush(stdout);
-        if (delay_ms)
-            Sleep((DWORD)delay_ms);
     }
+
+    pool_drain();   /* 等所有并发 nping 真正发完，再统计耗时 */
 
     printf("\n[完成] 会话=0x%08X 共经 nping 发出 元信息 %u 个 / 数据分片 %u 个，"
            "耗时 %lu ms\n",
@@ -384,6 +450,7 @@ int main(int argc, char **argv)
     fflush(stdout);
 
 done:
+    pool_drain();   /* 回收仍在运行的 nping 子进程，避免句柄泄漏 */
     if (hf != INVALID_HANDLE_VALUE)
         CloseHandle(hf);
     free(payload);
